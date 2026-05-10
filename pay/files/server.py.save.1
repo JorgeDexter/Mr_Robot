@@ -1,0 +1,130 @@
+import base64
+import json
+import os
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="x402 Demo Server")
+
+RECIPIENT_PUBKEY = "Hxj6gac2w4SvCx2mvDUf3ugykygynbkKmfcveL6rXJkt"
+FEE_PAYER_PUBKEY = "Hxj6gac2w4SvCx2mvDUf3ugykygynbkKmfcveL6rXJkt"
+USDC_MINT_DEVNET = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+PRICE_USDC_MICRO = "10000"
+NETWORK          = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+DEVNET_RPC       = "https://api.devnet.solana.com"
+
+def build_payment_required(resource_url: str) -> dict:
+    return {
+        "x402Version": 2,
+        "resource": {
+            "url": resource_url,
+            "description": "Acceso al recurso protegido (demo)",
+            "mimeType": "application/json",
+        },
+        "accepts": [
+            {
+                "scheme": "exact",
+                "network": NETWORK,
+                "amount": PRICE_USDC_MICRO,
+                "asset": USDC_MINT_DEVNET,
+                "payTo": RECIPIENT_PUBKEY,
+                "maxTimeoutSeconds": 60,
+                "extra": {"feePayer": FEE_PAYER_PUBKEY},
+        ],
+    }
+
+def encode_header(data: dict) -> str:
+    return base64.b64encode(json.dumps(data).encode()).decode()
+
+def decode_header(header_value: str) -> dict:
+    return json.loads(base64.b64decode(header_value).decode())
+
+async def verify_payment(payload: dict) -> tuple[bool, str]:
+    try:
+        tx_sig = payload.get("payload", {}).get("signature")
+        if not tx_sig:
+            return False, "No signature provided"
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                DEVNET_RPC,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTransaction",
+                    "params": [
+                        tx_sig,
+                        {"encoding": "json", "maxSupportedTransactionVersion": 0}
+                    ]
+                }
+            )
+            data = resp.json()
+
+        result = data.get("result")
+        if result is None:
+            return False, "Transaction not found on chain"
+
+        # Verificar que no hubo error en la tx
+        if result.get("meta", {}).get("err") is not None:
+            return False, "Transaction failed on chain"
+
+        # Verificar monto transferido
+        pre  = result["meta"]["preTokenBalances"]
+        post = result["meta"]["postTokenBalances"]
+
+        pre_map  = {b["accountIndex"]: int(b["uiTokenAmount"]["amount"]) for b in pre}
+        post_map = {b["accountIndex"]: int(b["uiTokenAmount"]["amount"]) for b in post}
+
+        expected = int(PRICE_USDC_MICRO)
+        for idx in post_map:
+            diff = post_map[idx] - pre_map.get(idx, 0)
+            if diff >= expected:
+                return True, None
+
+        return False, "Amount transferred is less than required"
+
+    except Exception as e:
+        print(f"[x402] Error verificando: {e}")
+        return False, str(e)
+
+async def require_payment(request: Request) -> tuple[bool, dict | None]:
+    sig_header = request.headers.get("payment-signature")
+    if not sig_header:
+        return False, None
+    try:
+        payload = decode_header(sig_header)
+    except Exception:
+        return False, None
+    is_valid, reason = await verify_payment(payload)
+    if not is_valid:
+        print(f"[x402] Pago inválido: {reason}")
+    return is_valid, payload if is_valid else None
+
+@app.get("/")
+async def root():
+    return {"mensaje": "x402 demo server corriendo", "endpoint_pagado": "/api/recurso"}
+
+@app.get("/api/recurso")
+async def recurso_pagado(request: Request):
+    is_valid, payload = await require_payment(request)
+    if not is_valid:
+        payment_required = build_payment_required(str(request.url))
+        return JSONResponse(
+            status_code=402,
+            content={"error": "Payment required"},
+            headers={"PAYMENT-REQUIRED": encode_header(payment_required)},
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "mensaje": "✅ Pago verificado. Acceso concedido.",
+            "data": {"resultado": "Contenido protegido de la demo"},
+            "pago": payload,
+        },
+    )
+
+@app.get("/api/recurso/info")
+async def info_pago(request: Request):
+    resource_url = str(request.url).replace("/info", "")
+    return build_payment_required(resource_url)
